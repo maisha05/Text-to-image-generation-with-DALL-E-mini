@@ -1,1 +1,1 @@
-# Text-to-image-generation-with-DALL-E-mini
+# Text-to-image-generation
