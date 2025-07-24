@@ -4,209 +4,181 @@ from torchvision import transforms
 from PIL import Image
 import os
 from datasets import load_dataset
-from diffusers import StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
-from transformers import CLIPTextModel, CLIPTokenizer
+from diffusers import (
+    UNet2DConditionModel,
+    AutoencoderKL,
+    DDPMScheduler,
+    StableDiffusionPipeline
+)
+from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 from torch.optim import AdamW
 from diffusers.optimization import get_scheduler
 from torch.cuda.amp import autocast, GradScaler
 
-# Configuration
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
-DATASET_SIZE = 300  # Using 500 images as specified
-BATCH_SIZE = 4
-NUM_EPOCHS = 2
-LEARNING_RATE = 1e-5
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-OUTPUT_DIR = "fine_tuned_sd"
-DATA_DIR = "/data/rashidm/COCO"  # Adjust this to your local dataset path if different
+# ─── CONFIG ────────────────────────────────────────────────────────────────
+MODEL_ID      = "runwayml/stable-diffusion-v1-5"
+DATA_DIR      = "/data/rashidm/COCO"
+DATASET_SIZE  = 5000
+BATCH_SIZE    = 4
+NUM_EPOCHS    = 3a
+LR            = 1e-5
+EPS           = 0.05   # FGSM magnitude
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+OUTPUT_CLEAN  = "clean_sd_pipeline"
+OUTPUT_PERT   = "pert_sd_pipeline"
 
-# Check GPU availability
 if not torch.cuda.is_available():
     raise RuntimeError("GPU not available. This script requires a CUDA-compatible GPU.")
-print(DEVICE)
+print("Using device:", DEVICE)
 
-# Load and preprocess COCO dataset
-def load_coco_subset():
-    dataset = load_dataset("phiyodr/coco2017", split="train").flatten().select(range(DATASET_SIZE))
-    return dataset
-
-# Custom Dataset to handle tensor conversion
-class COCODataset(Dataset):
-    def __init__(self, dataset, transform=None):
-        self.dataset = dataset
-        self.transform = transform
+# ─── DATASET CLASS ─────────────────────────────────────────────────────────
+class DatasetFromHF(Dataset):
+    """Converts HF COCO subset to (img_tensor, text_ids) pairs."""
+    def __init__(self, hf_ds, root, size=(512,512)):
+        self.ds    = hf_ds
+        self.root  = root
+        self.tf    = transforms.Compose([
+            transforms.Resize(size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5],[0.5])
+        ])
+        self.token = CLIPTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.ds)
 
-    def __getitem__(self, idx):
-        example = self.dataset[idx]
-        if self.transform:
-            image_path = os.path.join(DATA_DIR, example["file_name"])
-            image = Image.open(image_path).convert("RGB")
-            image = self.transform(image)
-        tokenizer = CLIPTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
-        text = tokenizer(
-            example["captions"][0],  # Use first caption
-            padding="max_length",
+    def __getitem__(self, i):
+        ex  = self.ds[i]
+        img = Image.open(os.path.join(self.root, ex["file_name"])).convert("RGB")
+
+        img = self.tf(img)
+        txt = self.token(
+            ex["captions"][0],
             max_length=77,
             truncation=True,
+            padding="max_length",
             return_tensors="pt"
-        ).input_ids[0]  # Get tensor of shape [sequence_length]
-        return {"processed_image": image, "text": text}
+        ).input_ids[0]
+        return {"img": img, "txt": txt}
 
-# Preprocessing transform
-transform = transforms.Compose([
-    transforms.Resize((512, 512)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
-])
-
-# Prepare dataset with custom Dataset class
-dataset = load_coco_subset()
-custom_dataset = COCODataset(dataset, transform=transform)
-dataloader = DataLoader(custom_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, collate_fn=lambda x: {
-    "processed_image": torch.stack([item["processed_image"] for item in x]),
-    "text": torch.stack([item["text"] for item in x])
-})
-
-# Load Stable Diffusion components
-unet = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet").to(DEVICE)
-text_encoder = CLIPTextModel.from_pretrained(MODEL_ID, subfolder="text_encoder").to(DEVICE)
-vae = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae").to(DEVICE)
-noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
-
-# Freeze VAE to save memory
-vae.requires_grad_(False)
-
-# Optimizer and scheduler
-optimizer = AdamW(unet.parameters(), lr=LEARNING_RATE)
-lr_scheduler = get_scheduler(
-    name="linear",
-    optimizer=optimizer,
-    num_warmup_steps=100,
-    num_training_steps=len(dataloader) * NUM_EPOCHS
-)
-
-# Mixed precision scaler
-scaler = GradScaler()
-
-# Training loop
-epsilon = 0.01
-
-unet.train()
-text_encoder.train()
-
-for epoch in range(NUM_EPOCHS):
-    for batch in dataloader:
-        images = batch["processed_image"].to(DEVICE)
-        text   = batch["text"].to(DEVICE)
-
-        # === 1) FGSM attack pass ===
-        images_adv = images.clone().detach().requires_grad_(True)
-
-        with autocast():
-            # 1a) embed text for attack
-            text_embeds_adv = text_encoder(text).last_hidden_state
-
-            # 1b) forward on images_adv
-            latents = vae.encode(images_adv).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(latents)
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.num_train_timesteps,
-                (latents.shape[0],),
-                device=DEVICE
-            )
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            noise_pred = unet(noisy_latents, timesteps, text_embeds_adv).sample
-            loss_adv = torch.nn.functional.mse_loss(noise_pred, noise)
-
-        # get pixel gradients and craft FGSM image
-        loss_adv.backward()
-        images_fgsm = (images_adv + epsilon * images_adv.grad.sign())\
-                        .detach().clamp(0, 1)
-
-        # clear model grads (we only wanted imgs’ grads above)
-        optimizer.zero_grad()
-        images_adv.grad.zero_()
-
-        # === 2) Fine‑tuning pass on adversarial images ===
-        with autocast():
-            # 2a) embed text *again* (fresh graph)
-            text_embeds = text_encoder(text).last_hidden_state
-
-            # 2b) forward on FGSM‑perturbed images
-            latents = vae.encode(images_fgsm).latent_dist.sample() * 0.18215
-            noise = torch.randn_like(latents)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            noise_pred = unet(noisy_latents, timesteps, text_embeds).sample
-            loss = torch.nn.functional.mse_loss(noise_pred, noise)
-
-        # update UNet weights
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        lr_scheduler.step()
-        optimizer.zero_grad()
-
-        print(
-            f"Epoch {epoch+1}/{NUM_EPOCHS}  "
-            f"FGSM-loss: {loss_adv.item():.4f}  "
-            f"Train-loss: {loss.item():.4f}"
-        )
-
-# Save fine-tuned model
-unet.save_pretrained(f"{OUTPUT_DIR}/unet")
-text_encoder.save_pretrained(f"{OUTPUT_DIR}/text_encoder")
-vae.save_pretrained(f"{OUTPUT_DIR}/vae")
-
-# Inference example
-pipeline = StableDiffusionPipeline.from_pretrained(
-    MODEL_ID,
-    unet=UNet2DConditionModel.from_pretrained(f"{OUTPUT_DIR}/unet"),
-    text_encoder=CLIPTextModel.from_pretrained(f"{OUTPUT_DIR}/text_encoder"),
-    vae=AutoencoderKL.from_pretrained(f"{OUTPUT_DIR}/vae")
-).to(DEVICE)
-
-# Generate an image
-image = pipeline("A dog playing in a park", num_inference_steps=50).images[0]
-image.save("generated_image_adv.png")
-
-from transformers import CLIPProcessor, CLIPModel
-
-# 1) Initialize CLIP
-clip_model   = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
-processor    = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
-def compute_clip_score(pipeline, prompt: str, steps: int = 50) -> float:
+# ─── FGSM PERTURBATION HELPER ──────────────────────────────────────────────
+def fgsm_perturb(images, text, unet, text_encoder, vae, scheduler, eps=EPS):
     """
-    Generate an image with `pipeline` from `prompt`, then compute
-    cosine similarity between CLIP image- and text-embeddings.
+    Run one FGSM step in image space to produce adversarial images.
     """
-    # a) Generate image
-    image = pipeline(prompt, num_inference_steps=steps).images[0]
+    images_adv = images.clone().detach().requires_grad_(True)
+    # forward pass
+    te    = text_encoder(text).last_hidden_state
+    lat   = vae.encode(images_adv).latent_dist.sample() * 0.18215
+    noise = torch.randn_like(lat)
+    t     = torch.randint(
+        0, scheduler.num_train_timesteps,
+        (lat.shape[0],), device=DEVICE
+    )
+    noisy = scheduler.add_noise(lat, noise, t)
+    pred  = unet(noisy, t, te).sample
+    loss  = torch.nn.functional.mse_loss(pred, noise)
+    # backprop to get gradients on images_adv
+    loss.backward()
+    # FGSM step
+    images_fgsm = (images_adv + eps * images_adv.grad.sign()).detach().clamp(0,1)
+    images_adv.grad.zero_()
+    return images_fgsm
 
-    # b) Preprocess for CLIP (batch of size 1)
-    inputs = processor(
-        text=[prompt],
-        images=[image],
-        return_tensors="pt",
-        padding=True
+# ─── TRAIN PIPELINE FUNCTION ───────────────────────────────────────────────
+def train_pipeline(perturb=False):
+    # Load and subset dataset
+    raw_ds = load_dataset("phiyodr/coco2017", split="train").flatten().select(range(DATASET_SIZE))
+    ds     = DatasetFromHF(raw_ds, DATA_DIR)
+    dl     = DataLoader(
+        ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4,
+        collate_fn=lambda b: {
+            "img": torch.stack([x["img"] for x in b]),
+            "txt": torch.stack([x["txt"] for x in b])
+        }
+    )
+
+    # Load model components
+    unet         = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet").to(DEVICE)
+    text_encoder = CLIPTextModel.from_pretrained(MODEL_ID, subfolder="text_encoder").to(DEVICE)
+    vae          = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae").to(DEVICE)
+    scheduler    = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+    vae.requires_grad_(False)
+
+    optimizer = AdamW(unet.parameters(), lr=LR)
+    lr_sched  = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=100,
+        num_training_steps=len(dl)*NUM_EPOCHS
+    )
+    scaler = GradScaler()
+    unet.train(); text_encoder.train()
+
+    # Training loop
+    for epoch in range(NUM_EPOCHS):
+        for batch in dl:
+            imgs = batch["img"].to(DEVICE)
+            txts = batch["txt"].to(DEVICE)
+
+            if perturb:
+                imgs = fgsm_perturb(imgs, txts, unet, text_encoder, vae, scheduler)
+
+            # fine-tune step
+            with autocast():
+                te = text_encoder(txts).last_hidden_state
+                lat = vae.encode(imgs).latent_dist.sample() * 0.18215
+                noise = torch.randn_like(lat)
+                t = torch.randint(
+                    0, scheduler.num_train_timesteps,
+                    (lat.shape[0],), device=DEVICE
+                )
+                noisy = scheduler.add_noise(lat, noise, t)
+                pred = unet(noisy, t, te).sample
+                loss = torch.nn.functional.mse_loss(pred, noise)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            lr_sched.step()
+            optimizer.zero_grad()
+
+        print(f"{'PERT' if perturb else 'CLEAN'} epoch {epoch+1}/{NUM_EPOCHS} – loss {loss.item():.4f}")
+
+    # Save full pipeline
+    out_dir = OUTPUT_PERT if perturb else OUTPUT_CLEAN
+    pipe = StableDiffusionPipeline.from_pretrained(
+        MODEL_ID,
+        unet=unet,
+        text_encoder=text_encoder,
+        vae=vae,
+        scheduler=scheduler
     ).to(DEVICE)
+    pipe.save_pretrained(out_dir)
+    return pipe
 
-    # c) Forward through CLIP
-    outputs = clip_model(**inputs)
+# ─── RUN: Clean vs. Perturbed Training ─────────────────────────────────────
+clean_pipe = train_pipeline(perturb=False)
+pert_pipe  = train_pipeline(perturb=True)
 
-    # d) logits_per_image is (batch_size, batch_size) similarity matrix
-    #    here batch_size=1, so [0,0] is our cos‑sim score
-    score = outputs.logits_per_image[0,0].item()
-    return score
+# ─── EVALUATION ────────────────────────────────────────────────────────────
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(DEVICE)
+processor  = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-# 2) Example usage:
-prompt     = "A dog playing in a park"
-clean_score = compute_clip_score(pipeline, prompt)
-adv_score   = compute_clip_score(pipeline, prompt)  # or use your adv‑fine‑tuned pipeline
+def clip_score(pipe, prompt, seed=42):
+    gen = torch.Generator(DEVICE).manual_seed(seed)
+    img = pipe(
+        prompt,
+        num_inference_steps=50,
+        guidance_scale=7.5,
+        generator=gen
+    ).images[0]
+    inp = processor(
+        text=[prompt], images=[img],
+        return_tensors="pt", padding=True
+    ).to(DEVICE)
+    return clip_model(**inp).logits_per_image[0,0].item()
 
-print(f"Clean CLIP‑score: {clean_score:.4f}")
-print(f"Attacked CLIP‑score: {adv_score:.4f}")
+prompt = "A dog playing in a park"
+print("Clean CLIP-score: %.4f" % clip_score(clean_pipe, prompt))
+print("Perturbed-trained CLIP-score: %.4f" % clip_score(pert_pipe, prompt))
